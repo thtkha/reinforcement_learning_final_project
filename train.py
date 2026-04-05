@@ -192,7 +192,8 @@ def optimize_dqn_step(
 
     q_values = dqn.q_network(states).gather(1, actions)
     with torch.no_grad():
-        next_q_values = dqn.target_network(next_states).max(dim=1, keepdim=True)[0]
+        next_actions = dqn.q_network(next_states).argmax(dim=1, keepdim=True)
+        next_q_values = dqn.target_network(next_states).gather(1, next_actions)
         targets = rewards + gamma * (1.0 - dones) * next_q_values
 
     loss = dqn.loss_fn(q_values, targets)
@@ -221,9 +222,9 @@ def train_dqn(
     batch_size: int = 64,
     gamma: float = 0.99,
     epsilon_start: float = 1.0,
-    epsilon_end: float = 0.05,
-    epsilon_decay: float = 0.995,
-    tau: float = 0.005,
+    epsilon_end: float = 0.10,
+    epsilon_decay: float = 0.997,
+    tau: float = 0.003,
     seed: int = 42,
     log_interval: int = 10,
 ) -> TrainingHistory:
@@ -458,12 +459,12 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for replay sampling")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--buffer-size", type=int, default=100_000, help="Replay buffer capacity")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
-    parser.add_argument("--epsilon-end", type=float, default=0.05, help="Final epsilon floor")
-    parser.add_argument("--epsilon-decay", type=float, default=0.995, help="Per-step epsilon decay")
-    parser.add_argument("--tau", type=float, default=0.005, help="Soft update factor")
+    parser.add_argument("--epsilon-end", type=float, default=0.10, help="Final epsilon floor")
+    parser.add_argument("--epsilon-decay", type=float, default=0.997, help="Per-step epsilon decay")
+    parser.add_argument("--tau", type=float, default=0.003, help="Soft update factor")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--log-interval", type=int, default=10, help="Log every N episodes")
     parser.add_argument(
