@@ -331,6 +331,31 @@ def plot_training_metrics(
     print(f"Saved training plots to: {output_file}")
 
 
+def save_model_checkpoint(
+    dqn: DQNComponents,
+    model_path: str,
+    history: TrainingHistory,
+    gamma: float,
+) -> None:
+    output_file = Path(model_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = {
+        "q_network_state_dict": dqn.q_network.state_dict(),
+        "target_network_state_dict": dqn.target_network.state_dict(),
+        "optimizer_state_dict": dqn.optimizer.state_dict(),
+        "obs_dim": dqn.obs_dim,
+        "n_actions": dqn.n_actions,
+        "gamma": gamma,
+        "episode_rewards": history.episode_rewards,
+        "episode_lengths": history.episode_lengths,
+        "episode_losses": history.episode_losses,
+        "epsilons": history.epsilons,
+    }
+    torch.save(checkpoint, output_file)
+    print(f"Saved model checkpoint to: {output_file}")
+
+
 def configure_highway_env(render_mode: str | None = None) -> gym.Env:
     """Create and configure the highway-v0 environment for kinematics observations."""
     env = gym.make("highway-v0", render_mode=render_mode)
@@ -448,6 +473,12 @@ def main() -> None:
         help="Output path for training plot image",
     )
     parser.add_argument(
+        "--model-path",
+        type=str,
+        default="artifacts/dqn_model.pt",
+        help="Output path for saved model checkpoint",
+    )
+    parser.add_argument(
         "--run-baseline",
         action="store_true",
         help="Run random-action baseline before training",
@@ -507,6 +538,7 @@ def main() -> None:
         )
 
         plot_training_metrics(history, output_path=args.plot_path)
+        save_model_checkpoint(dqn, model_path=args.model_path, history=history, gamma=args.gamma)
 
         print("\n=== Training Summary ===")
         print(f"Episodes trained : {len(history.episode_rewards)}")
