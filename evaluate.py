@@ -14,7 +14,11 @@ def load_q_network(model_path: Path, obs_dim: int, n_actions: int, device: torch
     """Load a trained Q-network checkpoint from disk."""
     q_network = QNetwork(input_dim=obs_dim, num_actions=n_actions).to(device)
 
-    checkpoint = torch.load(model_path, map_location=device)
+    # PyTorch 2.6+ defaults to weights_only=True, which can fail for richer checkpoint dicts.
+    try:
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(model_path, map_location=device)
 
     if isinstance(checkpoint, dict) and "q_network_state_dict" in checkpoint:
         state_dict = checkpoint["q_network_state_dict"]

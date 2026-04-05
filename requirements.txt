@@ -7,3 +7,4 @@ tqdm>=4.66.0
 stable-baselines3>=2.3.0
 imageio>=2.34.0
 opencv-python>=4.9.0
+moviepy>=2.2.1
