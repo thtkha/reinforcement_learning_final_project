@@ -337,6 +337,7 @@ def save_model_checkpoint(
     model_path: str,
     history: TrainingHistory,
     gamma: float,
+    reward_config: dict[str, float | list[float]],
 ) -> None:
     output_file = Path(model_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -348,6 +349,7 @@ def save_model_checkpoint(
         "obs_dim": dqn.obs_dim,
         "n_actions": dqn.n_actions,
         "gamma": gamma,
+        "reward_config": reward_config,
         "episode_rewards": history.episode_rewards,
         "episode_lengths": history.episode_lengths,
         "episode_losses": history.episode_losses,
@@ -357,7 +359,15 @@ def save_model_checkpoint(
     print(f"Saved model checkpoint to: {output_file}")
 
 
-def configure_highway_env(render_mode: str | None = None) -> gym.Env:
+def configure_highway_env(
+    render_mode: str | None = None,
+    collision_reward: float = -10.0,
+    right_lane_reward: float = 0.1,
+    high_speed_reward: float = 0.15,
+    lane_change_reward: float = -0.05,
+    reward_speed_low: float = 20.0,
+    reward_speed_high: float = 30.0,
+) -> gym.Env:
     """Create and configure the highway-v0 environment for kinematics observations."""
     env = gym.make("highway-v0", render_mode=render_mode)
 
@@ -377,6 +387,11 @@ def configure_highway_env(render_mode: str | None = None) -> gym.Env:
             },
             "policy_frequency": 5,
             "duration": 40,
+            "collision_reward": collision_reward,
+            "right_lane_reward": right_lane_reward,
+            "high_speed_reward": high_speed_reward,
+            "lane_change_reward": lane_change_reward,
+            "reward_speed_range": [reward_speed_low, reward_speed_high],
         }
     )
     env.reset(seed=42)
@@ -465,6 +480,42 @@ def main() -> None:
     parser.add_argument("--epsilon-end", type=float, default=0.10, help="Final epsilon floor")
     parser.add_argument("--epsilon-decay", type=float, default=0.997, help="Per-step epsilon decay")
     parser.add_argument("--tau", type=float, default=0.003, help="Soft update factor")
+    parser.add_argument(
+        "--collision-reward",
+        type=float,
+        default=-10.0,
+        help="Reward applied on collision (more negative increases safety pressure)",
+    )
+    parser.add_argument(
+        "--right-lane-reward",
+        type=float,
+        default=0.1,
+        help="Reward for staying on right lanes",
+    )
+    parser.add_argument(
+        "--high-speed-reward",
+        type=float,
+        default=0.15,
+        help="Reward weight for speed term",
+    )
+    parser.add_argument(
+        "--lane-change-reward",
+        type=float,
+        default=-0.05,
+        help="Penalty/reward for lane changes (negative discourages unnecessary lane switching)",
+    )
+    parser.add_argument(
+        "--reward-speed-low",
+        type=float,
+        default=20.0,
+        help="Lower bound for reward speed range",
+    )
+    parser.add_argument(
+        "--reward-speed-high",
+        type=float,
+        default=30.0,
+        help="Upper bound for reward speed range",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--log-interval", type=int, default=10, help="Log every N episodes")
     parser.add_argument(
@@ -492,7 +543,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    env = configure_highway_env(render_mode=None)
+    reward_config: dict[str, float | list[float]] = {
+        "collision_reward": args.collision_reward,
+        "right_lane_reward": args.right_lane_reward,
+        "high_speed_reward": args.high_speed_reward,
+        "lane_change_reward": args.lane_change_reward,
+        "reward_speed_range": [args.reward_speed_low, args.reward_speed_high],
+    }
+
+    env = configure_highway_env(
+        render_mode=None,
+        collision_reward=args.collision_reward,
+        right_lane_reward=args.right_lane_reward,
+        high_speed_reward=args.high_speed_reward,
+        lane_change_reward=args.lane_change_reward,
+        reward_speed_low=args.reward_speed_low,
+        reward_speed_high=args.reward_speed_high,
+    )
     try:
         print_spaces(env)
         dqn = initialize_dqn_components(
@@ -507,6 +574,7 @@ def main() -> None:
         print(f"Optimizer                : Adam (lr={args.lr})")
         print("Loss function            : SmoothL1Loss")
         print(f"Device                   : {dqn.device}")
+        print(f"Reward config            : {reward_config}")
 
         if args.run_baseline:
             stats = run_random_baseline(
@@ -539,7 +607,13 @@ def main() -> None:
         )
 
         plot_training_metrics(history, output_path=args.plot_path)
-        save_model_checkpoint(dqn, model_path=args.model_path, history=history, gamma=args.gamma)
+        save_model_checkpoint(
+            dqn,
+            model_path=args.model_path,
+            history=history,
+            gamma=args.gamma,
+            reward_config=reward_config,
+        )
 
         print("\n=== Training Summary ===")
         print(f"Episodes trained : {len(history.episode_rewards)}")
