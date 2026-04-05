@@ -1,10 +1,14 @@
 import argparse
 import random
 from dataclasses import dataclass
+from typing import Sequence
 
 import gymnasium as gym
 import highway_env  # noqa: F401 - required to register highway environments
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 
 @dataclass
@@ -13,6 +17,142 @@ class BaselineStats:
     std_reward: float
     mean_steps: float
     collision_rate: float
+
+
+class QNetwork(nn.Module):
+    """MLP Q-network for flattened kinematics observations."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_actions: int,
+        hidden_sizes: Sequence[int] = (256, 256),
+    ) -> None:
+        super().__init__()
+
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_sizes:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, num_actions))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if x.dim() > 2:
+            x = x.flatten(start_dim=1)
+        return self.network(x)
+
+
+class ReplayBuffer:
+    """Preallocated replay buffer for efficient off-policy sampling."""
+
+    def __init__(self, capacity: int, obs_shape: tuple[int, ...], device: torch.device) -> None:
+        self.capacity = capacity
+        self.device = device
+
+        self.states = np.zeros((capacity, *obs_shape), dtype=np.float32)
+        self.next_states = np.zeros((capacity, *obs_shape), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int64)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+
+        self.pos = 0
+        self.size = 0
+
+    def add(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
+        self.states[self.pos] = state
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.next_states[self.pos] = next_state
+        self.dones[self.pos] = float(done)
+
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(
+        self, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        indices = np.random.randint(0, self.size, size=batch_size)
+
+        states = torch.as_tensor(self.states[indices], device=self.device).flatten(start_dim=1)
+        actions = torch.as_tensor(self.actions[indices], device=self.device).unsqueeze(1)
+        rewards = torch.as_tensor(self.rewards[indices], device=self.device).unsqueeze(1)
+        next_states = torch.as_tensor(self.next_states[indices], device=self.device).flatten(start_dim=1)
+        dones = torch.as_tensor(self.dones[indices], device=self.device).unsqueeze(1)
+
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self) -> int:
+        return self.size
+
+
+@dataclass
+class DQNComponents:
+    q_network: QNetwork
+    target_network: QNetwork
+    optimizer: optim.Optimizer
+    loss_fn: nn.Module
+    replay_buffer: ReplayBuffer
+    device: torch.device
+    obs_dim: int
+    n_actions: int
+
+
+def initialize_dqn_components(
+    env: gym.Env,
+    buffer_capacity: int = 100_000,
+    learning_rate: float = 1e-3,
+    hidden_sizes: Sequence[int] = (256, 256),
+) -> DQNComponents:
+    if not isinstance(env.action_space, gym.spaces.Discrete):
+        raise ValueError("DQN requires a discrete action space.")
+
+    obs_shape = env.observation_space.shape
+    if obs_shape is None:
+        raise ValueError("Observation space must define a shape for DQN initialization.")
+
+    obs_dim = int(np.prod(obs_shape))
+    n_actions = env.action_space.n
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    q_network = QNetwork(
+        input_dim=obs_dim,
+        num_actions=n_actions,
+        hidden_sizes=hidden_sizes,
+    ).to(device)
+    target_network = QNetwork(
+        input_dim=obs_dim,
+        num_actions=n_actions,
+        hidden_sizes=hidden_sizes,
+    ).to(device)
+    target_network.load_state_dict(q_network.state_dict())
+    target_network.eval()
+
+    optimizer = optim.Adam(q_network.parameters(), lr=learning_rate)
+    loss_fn = nn.SmoothL1Loss()
+    replay_buffer = ReplayBuffer(capacity=buffer_capacity, obs_shape=obs_shape, device=device)
+
+    return DQNComponents(
+        q_network=q_network,
+        target_network=target_network,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        replay_buffer=replay_buffer,
+        device=device,
+        obs_dim=obs_dim,
+        n_actions=n_actions,
+    )
 
 
 def configure_highway_env(render_mode: str | None = None) -> gym.Env:
@@ -106,7 +246,7 @@ def run_random_baseline(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Step 1 setup: inspect highway-v0 spaces and run random baseline"
+        description="Step 1/2 setup: inspect env, random baseline, and DQN initialization"
     )
     parser.add_argument("--episodes", type=int, default=10, help="Random baseline episodes")
     parser.add_argument(
@@ -120,6 +260,15 @@ def main() -> None:
     env = configure_highway_env(render_mode=None)
     try:
         print_spaces(env)
+        dqn = initialize_dqn_components(env)
+        print("\n=== DQN Initialization ===")
+        print(f"Flattened observation dim: {dqn.obs_dim}")
+        print(f"Number of actions        : {dqn.n_actions}")
+        print("Q-network hidden layers  : [256, 256]")
+        print("Optimizer                : Adam (lr=1e-3)")
+        print("Loss function            : SmoothL1Loss")
+        print(f"Device                   : {dqn.device}")
+
         stats = run_random_baseline(
             env,
             episodes=args.episodes,
