@@ -1,10 +1,12 @@
 import argparse
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import gymnasium as gym
 import highway_env  # noqa: F401 - required to register highway environments
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -109,6 +111,14 @@ class DQNComponents:
     n_actions: int
 
 
+@dataclass
+class TrainingHistory:
+    episode_rewards: list[float]
+    episode_lengths: list[int]
+    episode_losses: list[float]
+    epsilons: list[float]
+
+
 def initialize_dqn_components(
     env: gym.Env,
     buffer_capacity: int = 100_000,
@@ -153,6 +163,172 @@ def initialize_dqn_components(
         obs_dim=obs_dim,
         n_actions=n_actions,
     )
+
+
+def select_action(
+    state: np.ndarray,
+    dqn: DQNComponents,
+    epsilon: float,
+    env: gym.Env,
+) -> int:
+    if random.random() < epsilon:
+        return int(env.action_space.sample())
+
+    state_tensor = torch.as_tensor(state, dtype=torch.float32, device=dqn.device).unsqueeze(0)
+    with torch.no_grad():
+        q_values = dqn.q_network(state_tensor)
+    return int(torch.argmax(q_values, dim=1).item())
+
+
+def optimize_dqn_step(
+    dqn: DQNComponents,
+    batch_size: int,
+    gamma: float,
+) -> float | None:
+    if len(dqn.replay_buffer) < batch_size:
+        return None
+
+    states, actions, rewards, next_states, dones = dqn.replay_buffer.sample(batch_size)
+
+    q_values = dqn.q_network(states).gather(1, actions)
+    with torch.no_grad():
+        next_q_values = dqn.target_network(next_states).max(dim=1, keepdim=True)[0]
+        targets = rewards + gamma * (1.0 - dones) * next_q_values
+
+    loss = dqn.loss_fn(q_values, targets)
+    dqn.optimizer.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(dqn.q_network.parameters(), max_norm=10.0)
+    dqn.optimizer.step()
+
+    return float(loss.item())
+
+
+def soft_update_target_network(
+    q_network: QNetwork,
+    target_network: QNetwork,
+    tau: float,
+) -> None:
+    for target_param, source_param in zip(target_network.parameters(), q_network.parameters()):
+        target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
+
+
+def train_dqn(
+    env: gym.Env,
+    dqn: DQNComponents,
+    train_episodes: int = 300,
+    max_steps: int = 200,
+    batch_size: int = 64,
+    gamma: float = 0.99,
+    epsilon_start: float = 1.0,
+    epsilon_end: float = 0.05,
+    epsilon_decay: float = 0.995,
+    tau: float = 0.005,
+    seed: int = 42,
+    log_interval: int = 10,
+) -> TrainingHistory:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    epsilon = epsilon_start
+    episode_rewards: list[float] = []
+    episode_lengths: list[int] = []
+    episode_losses: list[float] = []
+    epsilons: list[float] = []
+
+    for episode in range(train_episodes):
+        state, _ = env.reset(seed=seed + episode)
+        total_reward = 0.0
+        total_steps = 0
+        losses_this_episode: list[float] = []
+
+        done = False
+        truncated = False
+
+        while not (done or truncated) and total_steps < max_steps:
+            action = select_action(state, dqn, epsilon, env)
+            next_state, reward, done, truncated, _ = env.step(action)
+            terminal = done or truncated
+
+            dqn.replay_buffer.add(state, action, reward, next_state, terminal)
+            loss = optimize_dqn_step(dqn, batch_size=batch_size, gamma=gamma)
+            if loss is not None:
+                losses_this_episode.append(loss)
+                soft_update_target_network(dqn.q_network, dqn.target_network, tau=tau)
+
+            state = next_state
+            total_reward += reward
+            total_steps += 1
+            epsilon = max(epsilon_end, epsilon * epsilon_decay)
+
+        episode_rewards.append(float(total_reward))
+        episode_lengths.append(total_steps)
+        episode_losses.append(float(np.mean(losses_this_episode)) if losses_this_episode else 0.0)
+        epsilons.append(float(epsilon))
+
+        if (episode + 1) % log_interval == 0:
+            recent = episode_rewards[-log_interval:]
+            print(
+                f"Episode {episode + 1:04d}/{train_episodes} | "
+                f"AvgReward({log_interval}): {np.mean(recent):8.3f} | "
+                f"Len: {episode_lengths[-1]:3d} | Epsilon: {epsilon:.4f}"
+            )
+
+    return TrainingHistory(
+        episode_rewards=episode_rewards,
+        episode_lengths=episode_lengths,
+        episode_losses=episode_losses,
+        epsilons=epsilons,
+    )
+
+
+def rolling_mean(values: list[float], window: int = 20) -> np.ndarray:
+    if len(values) == 0:
+        return np.array([])
+    arr = np.array(values, dtype=np.float32)
+    if len(arr) < window:
+        return np.full_like(arr, arr.mean())
+    kernel = np.ones(window, dtype=np.float32) / window
+    valid = np.convolve(arr, kernel, mode="valid")
+    pad = np.full(window - 1, valid[0], dtype=np.float32)
+    return np.concatenate([pad, valid])
+
+
+def plot_training_metrics(
+    history: TrainingHistory,
+    output_path: str = "artifacts/training_metrics.png",
+    smoothing_window: int = 20,
+) -> None:
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    episodes = np.arange(1, len(history.episode_rewards) + 1)
+
+    reward_smooth = rolling_mean(history.episode_rewards, window=smoothing_window)
+    length_smooth = rolling_mean([float(v) for v in history.episode_lengths], window=smoothing_window)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    axes[0].plot(episodes, history.episode_rewards, alpha=0.35, label="Episode reward")
+    axes[0].plot(episodes, reward_smooth, linewidth=2, label=f"Reward MA({smoothing_window})")
+    axes[0].set_ylabel("Reward")
+    axes[0].set_title("DQN Training Metrics")
+    axes[0].legend(loc="best")
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(episodes, history.episode_lengths, alpha=0.35, label="Episode length")
+    axes[1].plot(episodes, length_smooth, linewidth=2, label=f"Length MA({smoothing_window})")
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("Length")
+    axes[1].legend(loc="best")
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150)
+    plt.close(fig)
+
+    print(f"Saved training plots to: {output_file}")
 
 
 def configure_highway_env(render_mode: str | None = None) -> gym.Env:
@@ -246,41 +422,97 @@ def run_random_baseline(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Step 1/2 setup: inspect env, random baseline, and DQN initialization"
+        description="DQN training for highway-v0 with epsilon-greedy and soft target updates"
     )
-    parser.add_argument("--episodes", type=int, default=10, help="Random baseline episodes")
+    parser.add_argument("--episodes", type=int, default=300, help="Training episodes")
     parser.add_argument(
         "--max-steps",
         type=int,
         default=200,
-        help="Max steps per episode for random baseline",
+        help="Max steps per episode",
+    )
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for replay sampling")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--buffer-size", type=int, default=100_000, help="Replay buffer capacity")
+    parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
+    parser.add_argument("--epsilon-end", type=float, default=0.05, help="Final epsilon floor")
+    parser.add_argument("--epsilon-decay", type=float, default=0.995, help="Per-step epsilon decay")
+    parser.add_argument("--tau", type=float, default=0.005, help="Soft update factor")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--log-interval", type=int, default=10, help="Log every N episodes")
+    parser.add_argument(
+        "--plot-path",
+        type=str,
+        default="artifacts/training_metrics.png",
+        help="Output path for training plot image",
+    )
+    parser.add_argument(
+        "--run-baseline",
+        action="store_true",
+        help="Run random-action baseline before training",
+    )
+    parser.add_argument(
+        "--baseline-episodes",
+        type=int,
+        default=10,
+        help="Episodes for random baseline if enabled",
     )
     args = parser.parse_args()
 
     env = configure_highway_env(render_mode=None)
     try:
         print_spaces(env)
-        dqn = initialize_dqn_components(env)
+        dqn = initialize_dqn_components(
+            env,
+            buffer_capacity=args.buffer_size,
+            learning_rate=args.lr,
+        )
         print("\n=== DQN Initialization ===")
         print(f"Flattened observation dim: {dqn.obs_dim}")
         print(f"Number of actions        : {dqn.n_actions}")
         print("Q-network hidden layers  : [256, 256]")
-        print("Optimizer                : Adam (lr=1e-3)")
+        print(f"Optimizer                : Adam (lr={args.lr})")
         print("Loss function            : SmoothL1Loss")
         print(f"Device                   : {dqn.device}")
 
-        stats = run_random_baseline(
+        if args.run_baseline:
+            stats = run_random_baseline(
+                env,
+                episodes=args.baseline_episodes,
+                max_steps=args.max_steps,
+                seed=args.seed,
+            )
+
+            print("\n=== Random Baseline Summary ===")
+            print(f"Mean reward      : {stats.mean_reward:.3f}")
+            print(f"Reward std       : {stats.std_reward:.3f}")
+            print(f"Mean episode step: {stats.mean_steps:.2f}")
+            print(f"Collision rate   : {stats.collision_rate * 100:.1f}%")
+
+        print("\n=== Starting DQN Training ===")
+        history = train_dqn(
             env,
-            episodes=args.episodes,
+            dqn,
+            train_episodes=args.episodes,
             max_steps=args.max_steps,
-            seed=42,
+            batch_size=args.batch_size,
+            gamma=args.gamma,
+            epsilon_start=args.epsilon_start,
+            epsilon_end=args.epsilon_end,
+            epsilon_decay=args.epsilon_decay,
+            tau=args.tau,
+            seed=args.seed,
+            log_interval=args.log_interval,
         )
 
-        print("\n=== Random Baseline Summary ===")
-        print(f"Mean reward      : {stats.mean_reward:.3f}")
-        print(f"Reward std       : {stats.std_reward:.3f}")
-        print(f"Mean episode step: {stats.mean_steps:.2f}")
-        print(f"Collision rate   : {stats.collision_rate * 100:.1f}%")
+        plot_training_metrics(history, output_path=args.plot_path)
+
+        print("\n=== Training Summary ===")
+        print(f"Episodes trained : {len(history.episode_rewards)}")
+        print(f"Final epsilon    : {history.epsilons[-1]:.4f}")
+        print(f"Mean reward (all): {np.mean(history.episode_rewards):.3f}")
+        print(f"Mean length (all): {np.mean(history.episode_lengths):.2f}")
     finally:
         env.close()
 
